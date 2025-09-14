@@ -14,11 +14,13 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ===== Settings =====
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
 LINE_ACCESS_TOKEN = os.environ["LINE_ACCESS_TOKEN"]
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "5"))
-DDB_TABLE_NAME = os.environ.get("DDB_TABLE_NAME", "chatbot-history")
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT"))
+DDB_TABLE_NAME = os.environ.get("DDB_TABLE_NAME")
+TTL_ATTR_NAME = os.environ.get("TTL_ATTR_NAME")            
+TTL_KEEP_SECONDS = int(os.environ.get("TTL_KEEP_SECONDS"))
 
 # ===== Clients =====
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
@@ -33,7 +35,6 @@ def lambda_handler(event, context):
         reply_token = ev.get("replyToken")
         user_text = ((ev.get("message") or {}).get("text") or "").strip()
 
-        # 会話のキー：基本はユーザー単位。グループ/ルームならそのIDを使うとスレッド共有になる
         source = ev.get("source") or {}
         user_id = source.get("userId")
         group_id = source.get("groupId")
@@ -42,11 +43,9 @@ def lambda_handler(event, context):
 
         if not reply_token or not user_text:
             return _ok({"message": "no text"})
-
-        # これまでの全履歴をDynamoDBから読み出す（ページネーションで最後まで）
         history_turns = _load_all_history(conv_pk)
 
-        # Anthropic messages に変換して、今回のユーザー発話を末尾に追加
+      
         messages = _to_anthropic_messages(history_turns)
         messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
 
@@ -56,7 +55,7 @@ def lambda_handler(event, context):
         # 返信
         _reply_line(reply_token, ai_text)
 
-        # 履歴保存（先にuser、続けてassistant）
+        # 履歴保存（先にuser、続けてassistant）— 既存の項目名は維持しつつTTL属性を追加
         _save_message(conv_pk, role="user", text=user_text)
         _save_message(conv_pk, role="assistant", text=ai_text)
 
@@ -73,7 +72,7 @@ def lambda_handler(event, context):
 def _ask_bedrock(messages: List[Dict[str, Any]]) -> str:
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1024,  # Anthropic仕様上必須（数値は任意に調整可）
+        "max_tokens": 1024,  
         "messages": messages,
     }
     resp = bedrock.invoke_model(
@@ -110,12 +109,23 @@ def _reply_line(reply_token: str, text: str):
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+def _now_s() -> int:
+    return int(time.time())
+
+def _ttl_value(now_s: Optional[int] = None) -> int:
+    """TTLに入れるUNIX秒（現在＋保持期間）"""
+    base = now_s if now_s is not None else _now_s()
+    return base + TTL_KEEP_SECONDS
+
 def _save_message(pk: str, role: str, text: str):
+    now_ms = _now_ms()
     item = {
-        "pk": pk,                           # 会話キー（ユーザー/グループ/ルーム）
-        "sk": Decimal(str(_now_ms())),      # ソートキー（ミリ秒）
-        "role": role,                       # "user" or "assistant"
-        "text": text,
+        "pk": pk,                          
+        "sk": Decimal(str(now_ms)),       
+        "role": role,                      
+        "text": text,                      
+        # 追加: TTL属性（トップレベル、UNIX秒）
+        TTL_ATTR_NAME: _ttl_value(),
     }
     table.put_item(Item=item)
 
@@ -130,7 +140,7 @@ def _load_all_history(pk: str) -> List[Dict[str, Any]]:
     while True:
         kwargs = {
             "KeyConditionExpression": Key("pk").eq(pk),
-            "ScanIndexForward": True,   # 古い→新しい
+            "ScanIndexForward": True,  
         }
         if last_evaluated_key:
             kwargs["ExclusiveStartKey"] = last_evaluated_key
